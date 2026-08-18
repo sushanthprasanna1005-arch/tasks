@@ -1,0 +1,6 @@
+branch_id,branch_name,city,state,country,manager_name,opened_at
+B001,Main Street Branch,New York,NY,USA,John Doe,2020-01-10 09:00:00
+B002,Downtown Branch,Chicago,IL,USA,Jane Smith,2020-03-15 10:00:00
+B003,Westside Branch,Houston,TX,USA,Robert Brown,2020-06-20 11:00:00
+B004,Airport Branch,Phoenix,AZ,USA,Emily Davis,2021-02-01 08:30:00
+B005,Harbor Branch,San Diego,CA,USA,Michael Wilson,2021-07-10 09:15:00

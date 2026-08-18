@@ -1,0 +1,145 @@
+import streamlit as st
+from snowflake.snowpark import Session
+import pandas as pd
+
+st.set_page_config(page_title="Banking Dashboard", layout="wide")
+st.title("🏦 Banking Dashboard")
+
+session = Session.builder.getOrCreate()
+
+# -------------------------
+# Filters
+# -------------------------
+st.sidebar.header("Filters")
+
+# Date range for transactions
+default_min_ts = session.sql("SELECT MIN(TRANSACTION_DATE) FROM BANKING_DB.CORE.FACT_TRANSACTIONS").collect()[0][0]
+default_max_ts = session.sql("SELECT MAX(TRANSACTION_DATE) FROM BANKING_DB.CORE.FACT_TRANSACTIONS").collect()[0][0]
+
+import datetime as dt
+
+def to_date(val):
+    if val is None:
+        return dt.date(2024, 1, 1)
+    if isinstance(val, dt.datetime):
+        return val.date()
+    if isinstance(val, dt.date):
+        return val
+    return dt.date(2024, 1, 1)
+
+min_date = to_date(default_min_ts)
+max_date = to_date(default_max_ts)
+
+start_date = st.sidebar.date_input("Transaction start date", value=min_date)
+end_date = st.sidebar.date_input("Transaction end date", value=max_date)
+
+# Channel filter
+channel_df = session.table("BANKING_DB.CORE.FACT_TRANSACTIONS").select("CHANNEL").distinct().to_pandas()
+channel_options = ["ALL"] + sorted([c for c in channel_df["CHANNEL"].dropna().unique()])
+selected_channel = st.sidebar.selectbox("Channel", channel_options)
+
+# Account type filter
+acct_type_df = session.table("BANKING_DB.CORE.DIM_ACCOUNT").select("ACCOUNT_TYPE").distinct().to_pandas()
+acct_type_options = ["ALL"] + sorted([a for a in acct_type_df["ACCOUNT_TYPE"].dropna().unique()])
+selected_account_type = st.sidebar.selectbox("Account type", acct_type_options)
+
+# -------------------------
+# Load facts & dims
+# -------------------------
+txn_df = session.table("BANKING_DB.CORE.FACT_TRANSACTIONS").to_pandas()
+balance_df = session.table("BANKING_DB.CORE.FACT_ACCOUNT_BALANCE_DAILY").to_pandas()
+
+dim_account = session.table("BANKING_DB.CORE.DIM_ACCOUNT").to_pandas()
+dim_customer = session.table("BANKING_DB.CORE.DIM_CUSTOMER").to_pandas()
+dim_branch = session.table("BANKING_DB.CORE.DIM_BRANCH").to_pandas()
+
+# -------------------------
+# Apply filters on transactions
+# -------------------------
+if "TRANSACTION_DATE" in txn_df.columns:
+    txn_df["TXN_DATE"] = txn_df["TRANSACTION_DATE"].dt.date
+    txn_df = txn_df[(txn_df["TXN_DATE"] >= start_date) & (txn_df["TXN_DATE"] <= end_date)]
+
+if selected_channel != "ALL" and "CHANNEL" in txn_df.columns:
+    txn_df = txn_df[txn_df["CHANNEL"] == selected_channel]
+
+# Join account type if needed
+if selected_account_type != "ALL" and "ACCOUNT_ID" in txn_df.columns and "ACCOUNT_ID" in dim_account.columns:
+    txn_df = txn_df.merge(dim_account[["ACCOUNT_ID", "ACCOUNT_TYPE"]], on="ACCOUNT_ID", how="left")
+    txn_df = txn_df[txn_df["ACCOUNT_TYPE"] == selected_account_type]
+
+# -------------------------
+# KPIs
+# -------------------------
+st.subheader("Key Metrics")
+
+total_txn_count = len(txn_df)
+total_deposit = 0.0
+total_withdrawal = 0.0
+
+if "AMOUNT" in txn_df.columns and "TRANSACTION_TYPE" in txn_df.columns:
+    deposits = txn_df[txn_df["TRANSACTION_TYPE"] == "DEPOSIT"]["AMOUNT"].sum()
+    withdrawals = txn_df[txn_df["TRANSACTION_TYPE"] == "WITHDRAWAL"]["AMOUNT"].sum()
+    total_deposit = float(deposits) if not pd.isna(deposits) else 0.0
+    total_withdrawal = float(withdrawals) if not pd.isna(withdrawals) else 0.0
+
+col1, col2, col3 = st.columns(3)
+col1.metric("Total Transactions", total_txn_count)
+col2.metric("Total Deposits", f"{total_deposit:,.2f} USD")
+col3.metric("Total Withdrawals", f"{total_withdrawal:,.2f} USD")
+
+# -------------------------
+# Charts
+# -------------------------
+st.subheader("Transactions by Type")
+
+if not txn_df.empty and "TRANSACTION_TYPE" in txn_df.columns:
+    type_counts = txn_df["TRANSACTION_TYPE"].value_counts().reset_index()
+    type_counts.columns = ["Transaction Type", "Count"]
+    st.bar_chart(type_counts.set_index("Transaction Type"))
+else:
+    st.info("No transaction data for the selected filters.")
+
+st.subheader("Transactions by Channel")
+
+if not txn_df.empty and "CHANNEL" in txn_df.columns:
+    channel_counts = txn_df["CHANNEL"].value_counts().reset_index()
+    channel_counts.columns = ["Channel", "Count"]
+    st.bar_chart(channel_counts.set_index("Channel"))
+else:
+    st.info("No transaction data for the selected filters.")
+
+st.subheader("Daily Closing Balance (Latest 30 Days)")
+
+if not balance_df.empty and "BALANCE_DATE" in balance_df.columns and "CLOSING_BALANCE" in balance_df.columns:
+    # Aggregate average closing balance per day across accounts
+    daily_balance = balance_df.groupby("BALANCE_DATE")["CLOSING_BALANCE"].mean().reset_index()
+    daily_balance.columns = ["Date", "Avg Closing Balance"]
+    daily_balance = daily_balance.sort_values("Date").tail(30)
+    st.line_chart(daily_balance.set_index("Date"))
+else:
+    st.info("No balance data available.")
+
+# -------------------------
+# Tables
+# -------------------------
+st.subheader("Recent Transactions")
+
+if not txn_df.empty:
+    cols = [c for c in ["TRANSACTION_ID", "ACCOUNT_ID", "TRANSACTION_DATE",
+                        "TRANSACTION_TYPE", "AMOUNT", "CHANNEL", "DESCRIPTION"]
+            if c in txn_df.columns]
+    st.dataframe(txn_df[cols].head(50), use_container_width=True, hide_index=True)
+else:
+    st.info("No transactions to display.")
+
+st.subheader("Account Balance Snapshot (Latest 20 Rows)")
+
+if not balance_df.empty:
+    cols = [c for c in ["BALANCE_ID", "ACCOUNT_ID", "BALANCE_DATE",
+                        "OPENING_BALANCE", "CLOSING_BALANCE", "CURRENCY"]
+            if c in balance_df.columns]
+    st.dataframe(balance_df[cols].sort_values("BALANCE_DATE", ascending=False).head(20),
+                 use_container_width=True, hide_index=True)
+else:
+    st.info("No balance data to display.")

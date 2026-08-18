@@ -1,0 +1,468 @@
+-- Banking pipeline: staging tables, core dimensions/facts, procedures, and task orchestration
+-- Co-authored with CoCo
+-- =========================
+-- 1. Database & schemas
+-- =========================
+CREATE DATABASE IF NOT EXISTS banking_db;
+CREATE SCHEMA IF NOT EXISTS banking_db.raw;
+CREATE SCHEMA IF NOT EXISTS banking_db.core;
+CREATE SCHEMA IF NOT EXISTS banking_db.app;
+
+USE DATABASE banking_db;
+USE SCHEMA raw;
+
+-- =========================
+-- 2. Storage integration (GCS)
+-- =========================
+CREATE OR REPLACE STORAGE INTEGRATION gcs_integration
+  TYPE = EXTERNAL_STAGE
+  STORAGE_PROVIDER = GCS
+  ENABLED = TRUE
+  STORAGE_ALLOWED_LOCATIONS = ('gcs://my-banking-dashboard');
+
+-- After this, run:
+DESC INTEGRATION gcs_integration;
+-- Grant roles/storage.objectViewer on gs://my-banking-dashboard
+-- to the shown STORAGE_GCP_SERVICE_ACCOUNT in GCP IAM.
+
+-- =========================
+-- 3. File format & stage
+-- =========================
+CREATE OR REPLACE FILE FORMAT banking_db.raw.csv_ff
+  TYPE = CSV
+  SKIP_HEADER = 0
+  PARSE_HEADER = TRUE
+  FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+  NULL_IF = ('');
+
+CREATE OR REPLACE STAGE banking_db.raw.gcs_stage
+  STORAGE_INTEGRATION = gcs_integration
+  URL = 'gcs://my-banking-dashboard'
+  FILE_FORMAT = banking_db.raw.csv_ff;
+
+-- Optional: test
+LIST @banking_db.raw.gcs_stage/customers/;
+LIST @banking_db.raw.gcs_stage/accounts/;
+LIST @banking_db.raw.gcs_stage/branches/;
+LIST @banking_db.raw.gcs_stage/transactions/;
+LIST @banking_db.raw.gcs_stage/account_balance_daily/;
+
+-- =========================
+-- 3b. Staging tables (RAW layer - landing zone for COPY INTO)
+-- =========================
+CREATE TABLE IF NOT EXISTS banking_db.raw.stg_customers (
+  customer_id   VARCHAR,
+  customer_name VARCHAR,
+  email         VARCHAR,
+  phone         VARCHAR,
+  country       VARCHAR,
+  city          VARCHAR,
+  created_at    VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS banking_db.raw.stg_accounts (
+  account_id   VARCHAR,
+  customer_id  VARCHAR,
+  account_type VARCHAR,
+  branch_id    VARCHAR,
+  opened_at    VARCHAR,
+  status       VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS banking_db.raw.stg_branches (
+  branch_id    VARCHAR,
+  branch_name  VARCHAR,
+  city         VARCHAR,
+  state        VARCHAR,
+  country      VARCHAR,
+  manager_name VARCHAR,
+  opened_at    VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS banking_db.raw.stg_transactions (
+  transaction_id   VARCHAR,
+  account_id       VARCHAR,
+  transaction_date VARCHAR,
+  transaction_type VARCHAR,
+  amount           VARCHAR,
+  currency         VARCHAR,
+  channel          VARCHAR,
+  description      VARCHAR
+);
+
+CREATE TABLE IF NOT EXISTS banking_db.raw.stg_balances (
+  balance_id      VARCHAR,
+  account_id      VARCHAR,
+  balance_date    VARCHAR,
+  opening_balance VARCHAR,
+  closing_balance VARCHAR,
+  currency        VARCHAR
+);
+
+-- =========================
+-- 4. Final tables (core)
+-- =========================
+USE SCHEMA banking_db.core;
+
+-- Dimensions
+CREATE OR REPLACE TABLE banking_db.core.dim_customer (
+  customer_id   VARCHAR NOT NULL,
+  customer_name VARCHAR,
+  email         VARCHAR,
+  phone         VARCHAR,
+  country       VARCHAR,
+  city          VARCHAR,
+  created_at    TIMESTAMP_NTZ,
+  CONSTRAINT pk_dim_customer PRIMARY KEY (customer_id)
+);
+
+CREATE OR REPLACE TABLE banking_db.core.dim_account (
+  account_id    VARCHAR NOT NULL,
+  customer_id   VARCHAR,
+  account_type  VARCHAR,
+  branch_id     VARCHAR,
+  opened_at     TIMESTAMP_NTZ,
+  status        VARCHAR,
+  CONSTRAINT pk_dim_account PRIMARY KEY (account_id)
+);
+
+CREATE OR REPLACE TABLE banking_db.core.dim_branch (
+  branch_id     VARCHAR NOT NULL,
+  branch_name   VARCHAR,
+  city          VARCHAR,
+  state         VARCHAR,
+  country       VARCHAR,
+  manager_name  VARCHAR,
+  opened_at     TIMESTAMP_NTZ,
+  CONSTRAINT pk_dim_branch PRIMARY KEY (branch_id)
+);
+
+-- Optional: you can also generate dim_date in Snowflake; here we keep it simple
+-- and derive dates from facts.
+
+-- Facts
+CREATE OR REPLACE TABLE banking_db.core.fact_transactions (
+  transaction_id   VARCHAR NOT NULL,
+  account_id       VARCHAR,
+  transaction_date TIMESTAMP_NTZ,
+  transaction_type VARCHAR,
+  amount           NUMBER(18,2),
+  currency         VARCHAR,
+  channel          VARCHAR,
+  description      VARCHAR,
+  CONSTRAINT pk_fact_transactions PRIMARY KEY (transaction_id)
+);
+
+CREATE OR REPLACE TABLE banking_db.core.fact_account_balance_daily (
+  balance_id      VARCHAR NOT NULL,
+  account_id      VARCHAR,
+  balance_date    DATE,
+  opening_balance NUMBER(18,2),
+  closing_balance NUMBER(18,2),
+  currency        VARCHAR,
+  CONSTRAINT pk_fact_balance PRIMARY KEY (balance_id)
+);
+
+
+USE SCHEMA banking_db.raw;
+
+CREATE OR REPLACE PROCEDURE banking_db.raw.proc_load_merge_customers()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+
+  COPY INTO banking_db.raw.stg_customers
+  FROM @banking_db.raw.gcs_stage/customers/
+  FILE_FORMAT = (FORMAT_NAME = 'banking_db.raw.csv_ff')
+  MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+  ON_ERROR = CONTINUE;
+
+  MERGE INTO banking_db.core.dim_customer AS tgt
+  USING (
+    SELECT
+      customer_id,
+      customer_name,
+      email,
+      phone,
+      country,
+      city,
+      TRY_TO_TIMESTAMP_NTZ(created_at) AS created_at
+    FROM banking_db.raw.stg_customers
+    WHERE customer_id IS NOT NULL
+  ) AS src
+  ON tgt.customer_id = src.customer_id
+  WHEN MATCHED THEN
+    UPDATE SET
+      tgt.customer_name = src.customer_name,
+      tgt.email         = src.email,
+      tgt.phone         = src.phone,
+      tgt.country       = src.country,
+      tgt.city          = src.city,
+      tgt.created_at    = COALESCE(tgt.created_at, src.created_at)
+  WHEN NOT MATCHED THEN
+    INSERT (customer_id, customer_name, email, phone, country, city, created_at)
+    VALUES (src.customer_id, src.customer_name, src.email, src.phone,
+            src.country, src.city, src.created_at);
+
+  TRUNCATE TABLE banking_db.raw.stg_customers;
+
+  RETURN 'Customers load + merge completed';
+END;
+$$;
+
+
+CREATE OR REPLACE PROCEDURE banking_db.raw.proc_load_merge_accounts()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+
+  COPY INTO banking_db.raw.stg_accounts
+  FROM @banking_db.raw.gcs_stage/accounts/
+  FILE_FORMAT = (FORMAT_NAME = 'banking_db.raw.csv_ff')
+  MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+  ON_ERROR = CONTINUE;
+
+  MERGE INTO banking_db.core.dim_account AS tgt
+  USING (
+    SELECT
+      account_id,
+      customer_id,
+      account_type,
+      branch_id,
+      TRY_TO_TIMESTAMP_NTZ(opened_at) AS opened_at,
+      status
+    FROM banking_db.raw.stg_accounts
+    WHERE account_id IS NOT NULL
+  ) AS src
+  ON tgt.account_id = src.account_id
+  WHEN MATCHED THEN
+    UPDATE SET
+      tgt.customer_id  = src.customer_id,
+      tgt.account_type = src.account_type,
+      tgt.branch_id    = src.branch_id,
+      tgt.opened_at    = COALESCE(tgt.opened_at, src.opened_at),
+      tgt.status       = src.status
+  WHEN NOT MATCHED THEN
+    INSERT (account_id, customer_id, account_type, branch_id, opened_at, status)
+    VALUES (src.account_id, src.customer_id, src.account_type, src.branch_id,
+            src.opened_at, src.status);
+
+  TRUNCATE TABLE banking_db.raw.stg_accounts;
+
+  RETURN 'Accounts load + merge completed';
+END;
+$$;
+
+
+CREATE OR REPLACE PROCEDURE banking_db.raw.proc_load_merge_branches()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+
+  COPY INTO banking_db.raw.stg_branches
+  FROM @banking_db.raw.gcs_stage/branches/
+  FILE_FORMAT = (FORMAT_NAME = 'banking_db.raw.csv_ff')
+  MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+  ON_ERROR = CONTINUE;
+
+  MERGE INTO banking_db.core.dim_branch AS tgt
+  USING (
+    SELECT
+      branch_id,
+      branch_name,
+      city,
+      state,
+      country,
+      manager_name,
+      TRY_TO_TIMESTAMP_NTZ(opened_at) AS opened_at
+    FROM banking_db.raw.stg_branches
+    WHERE branch_id IS NOT NULL
+  ) AS src
+  ON tgt.branch_id = src.branch_id
+  WHEN MATCHED THEN
+    UPDATE SET
+      tgt.branch_name  = src.branch_name,
+      tgt.city         = src.city,
+      tgt.state        = src.state,
+      tgt.country      = src.country,
+      tgt.manager_name = src.manager_name,
+      tgt.opened_at    = COALESCE(tgt.opened_at, src.opened_at)
+  WHEN NOT MATCHED THEN
+    INSERT (branch_id, branch_name, city, state, country, manager_name, opened_at)
+    VALUES (src.branch_id, src.branch_name, src.city, src.state,
+            src.country, src.manager_name, src.opened_at);
+
+  TRUNCATE TABLE banking_db.raw.stg_branches;
+
+  RETURN 'Branches load + merge completed';
+END;
+$$;
+
+
+CREATE OR REPLACE PROCEDURE banking_db.raw.proc_load_merge_transactions()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+
+  COPY INTO banking_db.raw.stg_transactions
+  FROM @banking_db.raw.gcs_stage/transactions/
+  FILE_FORMAT = (FORMAT_NAME = 'banking_db.raw.csv_ff')
+  MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+  ON_ERROR = CONTINUE;
+
+  MERGE INTO banking_db.core.fact_transactions AS tgt
+  USING (
+    SELECT
+      transaction_id,
+      account_id,
+      TRY_TO_TIMESTAMP_NTZ(transaction_date) AS transaction_date,
+      transaction_type,
+      TRY_TO_NUMBER(amount) AS amount,
+      currency,
+      channel,
+      description
+    FROM banking_db.raw.stg_transactions
+    WHERE transaction_id IS NOT NULL
+  ) AS src
+  ON tgt.transaction_id = src.transaction_id
+  WHEN MATCHED THEN
+    UPDATE SET
+      tgt.account_id       = src.account_id,
+      tgt.transaction_date = src.transaction_date,
+      tgt.transaction_type = src.transaction_type,
+      tgt.amount           = src.amount,
+      tgt.currency         = src.currency,
+      tgt.channel          = src.channel,
+      tgt.description      = src.description
+  WHEN NOT MATCHED THEN
+    INSERT (transaction_id, account_id, transaction_date, transaction_type,
+           amount, currency, channel, description)
+    VALUES (src.transaction_id, src.account_id, src.transaction_date,
+            src.transaction_type, src.amount, src.currency, src.channel, src.description);
+
+  TRUNCATE TABLE banking_db.raw.stg_transactions;
+
+  RETURN 'Transactions load + merge completed';
+END;
+$$;
+
+CREATE OR REPLACE PROCEDURE banking_db.raw.proc_load_merge_balances()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+
+  COPY INTO banking_db.raw.stg_balances
+  FROM @banking_db.raw.gcs_stage/account_balance_daily/
+  FILE_FORMAT = (FORMAT_NAME = 'banking_db.raw.csv_ff')
+  MATCH_BY_COLUMN_NAME = CASE_INSENSITIVE
+  ON_ERROR = CONTINUE;
+
+  MERGE INTO banking_db.core.fact_account_balance_daily AS tgt
+  USING (
+    SELECT
+      balance_id,
+      account_id,
+      TRY_TO_DATE(balance_date) AS balance_date,
+      TRY_TO_NUMBER(opening_balance) AS opening_balance,
+      TRY_TO_NUMBER(closing_balance) AS closing_balance,
+      currency
+    FROM banking_db.raw.stg_balances
+    WHERE balance_id IS NOT NULL
+  ) AS src
+  ON tgt.balance_id = src.balance_id
+  WHEN MATCHED THEN
+    UPDATE SET
+      tgt.account_id      = src.account_id,
+      tgt.balance_date    = src.balance_date,
+      tgt.opening_balance = src.opening_balance,
+      tgt.closing_balance = src.closing_balance,
+      tgt.currency        = src.currency
+  WHEN NOT MATCHED THEN
+    INSERT (balance_id, account_id, balance_date, opening_balance, closing_balance, currency)
+    VALUES (src.balance_id, src.account_id, src.balance_date,
+            src.opening_balance, src.closing_balance, src.currency);
+
+  TRUNCATE TABLE banking_db.raw.stg_balances;
+
+  RETURN 'Balances load + merge completed';
+END;
+$$;
+
+
+-- =========================
+-- 6. Warehouse & tasks
+-- =========================
+USE ROLE ACCOUNTADMIN;
+
+CREATE OR REPLACE WAREHOUSE banking_wh
+  WAREHOUSE_SIZE = XSMALL
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE;
+
+USE SCHEMA banking_db.raw;
+
+CREATE OR REPLACE TASK banking_db.raw.task_load_merge_customers
+  WAREHOUSE = banking_wh
+  SCHEDULE = 'USING CRON */2 * * * * UTC'
+AS
+CALL banking_db.raw.proc_load_merge_customers();
+
+CREATE OR REPLACE TASK banking_db.raw.task_load_merge_accounts
+  WAREHOUSE = banking_wh
+  SCHEDULE = 'USING CRON */2 * * * * UTC'
+AS
+CALL banking_db.raw.proc_load_merge_accounts();
+
+CREATE OR REPLACE TASK banking_db.raw.task_load_merge_branches
+  WAREHOUSE = banking_wh
+  SCHEDULE = 'USING CRON */2 * * * * UTC'
+AS
+CALL banking_db.raw.proc_load_merge_branches();
+
+CREATE OR REPLACE TASK banking_db.raw.task_load_merge_transactions
+  WAREHOUSE = banking_wh
+  SCHEDULE = 'USING CRON */2 * * * * UTC'
+AS
+CALL banking_db.raw.proc_load_merge_transactions();
+
+CREATE OR REPLACE TASK banking_db.raw.task_load_merge_balances
+  WAREHOUSE = banking_wh
+  SCHEDULE = 'USING CRON */2 * * * * UTC'
+AS
+CALL banking_db.raw.proc_load_merge_balances();
+
+-- Start tasks
+ALTER TASK banking_db.raw.task_load_merge_customers RESUME;
+ALTER TASK banking_db.raw.task_load_merge_accounts RESUME;
+ALTER TASK banking_db.raw.task_load_merge_branches RESUME;
+ALTER TASK banking_db.raw.task_load_merge_transactions RESUME;
+ALTER TASK banking_db.raw.task_load_merge_balances RESUME;
+
+SHOW TASKS IN SCHEMA banking_db.raw;
+
+
+
+CALL banking_db.raw.proc_load_merge_customers();
+CALL banking_db.raw.proc_load_merge_accounts();
+CALL banking_db.raw.proc_load_merge_branches();
+CALL banking_db.raw.proc_load_merge_transactions();
+CALL banking_db.raw.proc_load_merge_balances();
+
+SELECT * FROM banking_db.core.dim_customer LIMIT 10;
+SELECT * FROM banking_db.core.dim_account LIMIT 10;
+SELECT * FROM banking_db.core.dim_branch LIMIT 10;
+SELECT * FROM banking_db.core.fact_transactions LIMIT 10;
+SELECT * FROM banking_db.core.fact_account_balance_daily LIMIT 10;
+
+
+
