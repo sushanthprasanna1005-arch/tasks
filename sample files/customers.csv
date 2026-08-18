@@ -1,0 +1,11 @@
+customer_id,customer_name,email,phone,country,city,created_at
+C001,Alice Johnson,alice.johnson@example.com,+1-555-1001,USA,New York,2024-01-10 09:00:00
+C002,Bob Smith,bob.smith@example.com,+1-555-1002,USA,Chicago,2024-01-12 10:30:00
+C003,Charlie Brown,charlie.brown@example.com,+1-555-1003,USA,Houston,2024-02-01 11:15:00
+C004,Diana Lee,diana.lee@example.com,+1-555-1004,USA,Phoenix,2024-02-15 14:00:00
+C005,Ethan Davis,ethan.davis@example.com,+1-555-1005,USA,Philadelphia,2024-03-05 09:45:00
+C006,Fiona Martinez,fiona.martinez@example.com,+1-555-1006,USA,San Antonio,2024-03-10 10:00:00
+C007,George Wilson,george.wilson@example.com,+1-555-1007,USA,San Diego,2024-04-01 08:30:00
+C008,Hannah Taylor,hannah.taylor@example.com,+1-555-1008,USA,Dallas,2024-04-20 13:20:00
+C009,Ian Anderson,ian.anderson@example.com,+1-555-1009,USA,San Jose,2024-05-05 15:10:00
+C010,Julia Thomas,julia.thomas@example.com,+1-555-1010,USA,Austin,2024-05-15 09:00:00
