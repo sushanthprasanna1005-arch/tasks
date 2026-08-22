@@ -1,0 +1,153 @@
+-- ============================================================
+-- SNOWFLAKE COST OPTIMIZATION CASE STUDY
+-- Regular View vs. Materialized View — Full Process Script
+-- ============================================================
+
+-- ------------------------------------------------------------
+-- STEP 1 — Create an isolated workspace
+-- ------------------------------------------------------------
+CREATE OR REPLACE DATABASE cost_demo_db;
+CREATE OR REPLACE SCHEMA cost_demo_db.tpch;
+USE DATABASE cost_demo_db;
+USE SCHEMA tpch;
+
+-- ------------------------------------------------------------
+-- STEP 2 — Create the compute warehouse
+-- ------------------------------------------------------------
+CREATE OR REPLACE WAREHOUSE demo_wh
+  WAREHOUSE_SIZE = 'SMALL'
+  AUTO_SUSPEND = 60
+  AUTO_RESUME = TRUE
+  INITIALLY_SUSPENDED = TRUE;
+
+USE WAREHOUSE demo_wh;
+
+-- ------------------------------------------------------------
+-- STEP 3 — Copy source tables out of the read-only sample share
+-- (Views cannot be built directly on SNOWFLAKE_SAMPLE_DATA)
+-- ------------------------------------------------------------
+CREATE OR REPLACE TABLE orders AS
+SELECT * FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF10.ORDERS;
+
+CREATE OR REPLACE TABLE customer AS
+SELECT * FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF10.CUSTOMER;
+
+CREATE OR REPLACE TABLE nation AS
+SELECT * FROM SNOWFLAKE_SAMPLE_DATA.TPCH_SF10.NATION;
+
+-- ------------------------------------------------------------
+-- STEP 4 — Build the baseline: a regular (multi-table) view
+-- ------------------------------------------------------------
+CREATE OR REPLACE VIEW nation_order_summary_view AS
+SELECT
+    n.n_name AS nation,
+    COUNT(o.o_orderkey) AS order_count,
+    SUM(o.o_totalprice) AS total_order_value,
+    AVG(o.o_totalprice) AS avg_order_value
+FROM orders o
+JOIN customer c ON o.o_custkey = c.c_custkey
+JOIN nation n ON c.c_nationkey = n.n_nationkey
+GROUP BY n.n_name;
+
+SELECT * FROM nation_order_summary_view ORDER BY total_order_value DESC;
+
+-- ------------------------------------------------------------
+-- STEP 5 — Measure the baseline cost
+-- (Use INFORMATION_SCHEMA, not ACCOUNT_USAGE, for immediate results —
+--  ACCOUNT_USAGE.QUERY_HISTORY can lag up to ~45 minutes)
+-- ------------------------------------------------------------
+SELECT query_text, total_elapsed_time, warehouse_name
+FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY())
+WHERE query_text ILIKE '%nation_order_summary_view%'
+ORDER BY start_time DESC
+LIMIT 5;
+
+-- ------------------------------------------------------------
+-- STEP 6 — Attempt a materialized view directly on the join
+-- THIS WILL FAIL — kept here intentionally to document the error:
+-- "Invalid materialized view definition. More than one table
+--  referenced in the view definition."
+-- Materialized views allow exactly ONE base table — no joins.
+-- ------------------------------------------------------------
+-- CREATE OR REPLACE MATERIALIZED VIEW nation_order_summary_mv AS
+-- SELECT
+--     n.n_name AS nation,
+--     COUNT(o.o_orderkey) AS order_count,
+--     SUM(o.o_totalprice) AS total_order_value,
+--     AVG(o.o_totalprice) AS avg_order_value
+-- FROM orders o
+-- JOIN customer c ON o.o_custkey = c.c_custkey
+-- JOIN nation n ON c.c_nationkey = n.n_nationkey
+-- GROUP BY n.n_name;
+
+-- ------------------------------------------------------------
+-- STEP 7 — Fix: denormalize the join into a single physical table
+-- ------------------------------------------------------------
+CREATE OR REPLACE TABLE orders_denormalized AS
+SELECT
+    o.o_orderkey,
+    o.o_totalprice,
+    o.o_orderdate,
+    c.c_custkey,
+    n.n_name AS nation
+FROM orders o
+JOIN customer c ON o.o_custkey = c.c_custkey
+JOIN nation n ON c.c_nationkey = n.n_nationkey;
+
+-- ------------------------------------------------------------
+-- STEP 8 — Build the materialized view on the single flat table
+-- ------------------------------------------------------------
+CREATE OR REPLACE MATERIALIZED VIEW nation_order_summary_mv AS
+SELECT
+    nation,
+    COUNT(o_orderkey) AS order_count,
+    SUM(o_totalprice) AS total_order_value,
+    AVG(o_totalprice) AS avg_order_value
+FROM orders_denormalized
+GROUP BY nation;
+
+SELECT * FROM nation_order_summary_mv ORDER BY total_order_value DESC;
+
+-- ------------------------------------------------------------
+-- STEP 9 — Measure the materialized view cost
+-- ------------------------------------------------------------
+SELECT query_text, total_elapsed_time, warehouse_name
+FROM TABLE(INFORMATION_SCHEMA.QUERY_HISTORY())
+WHERE query_text ILIKE '%nation_order_summary_mv%'
+ORDER BY start_time DESC
+LIMIT 5;
+
+-- ------------------------------------------------------------
+-- STEP 10 — Check background refresh cost (the hidden tradeoff)
+-- Note: this view can lag 1+ hours; there is no real-time
+-- INFORMATION_SCHEMA equivalent for refresh history.
+-- ------------------------------------------------------------
+SELECT *
+FROM SNOWFLAKE.ACCOUNT_USAGE.MATERIALIZED_VIEW_REFRESH_HISTORY
+WHERE TABLE_NAME = 'NATION_ORDER_SUMMARY_MV'
+ORDER BY START_TIME DESC;
+
+-- ------------------------------------------------------------
+-- STEP 11 — Clean up
+-- ------------------------------------------------------------
+DROP MATERIALIZED VIEW nation_order_summary_mv;
+DROP VIEW nation_order_summary_view;
+DROP TABLE orders_denormalized;
+DROP TABLE orders;
+DROP TABLE customer;
+DROP TABLE nation;
+ALTER WAREHOUSE demo_wh SUSPEND;
+
+-- Optional — remove the entire workspace in one command if not reusing it:
+-- DROP DATABASE cost_demo_db;
+
+
+-- ============================================================
+-- SECTION 5 REFERENCE — Where to verify cost directly
+-- (Not part of the exercise flow — reference queries only)
+-- ============================================================
+
+-- Credits consumed per warehouse per hour
+SELECT * FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+ORDER BY START_TIME DESC;
+
